@@ -44,16 +44,12 @@ def re_skills(repo_name: str | None):
         git_service.pull_repo(code_repo_dir)
         click.echo(f"✓ code/{repo_name} is up to date")
 
-        # Show RE prompt
-        docs_re_path = f"docs/{docs_repo_name}/re-skills/{repo_name}/"
-        click.echo("\n  Open your AI chat and paste the following prompt:")
-        click.echo("")
-        click.echo("┌──────────────────────────────────────────────────────────────┐")
-        click.echo(f"│  Using AI-DLC, reverse engineer the codebase at              │")
-        click.echo(f"│  code/{repo_name + '/':<54}│")
-        click.echo(f"│  and generate the skills/knowledge base files.               │")
-        click.echo(f"│  Store the output in {docs_re_path:<41}│")
-        click.echo("└──────────────────────────────────────────────────────────────┘")
+        # Point to @re-refresh prompt instead of printing the full prompt
+        click.echo(f"\n  Open your AI chat and type:")
+        click.echo(f"\n      @re-refresh")
+        click.echo(f"\n  This will instruct the AI agent to reverse engineer code/{repo_name}/")
+        click.echo(f"  and store the output in docs/{docs_repo_name}/skills/{repo_name}/")
+        click.echo(f"\n  Tip: if @re-refresh is not available, run 'aidlc update-docs' to sync prompts.")
 
     except AidlcError as e:
         click.echo(f"✗ {e}", err=True)

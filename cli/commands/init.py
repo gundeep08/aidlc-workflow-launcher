@@ -6,6 +6,7 @@ import click
 from cli.config.constants import AIDLC_WORKFLOWS_REPO_OWNER, AIDLC_WORKFLOWS_REPO_NAME
 from cli.config.constants import DOCS_DIR
 from cli.exceptions import AidlcError
+from cli.commands.update_docs import _sync_prompts
 from cli.services import git_service, github_release_service, platform_service, workspace_config_service
 
 
@@ -44,6 +45,9 @@ def init():
             click.echo(f"✓ Docs repo cloned")
         else:
             click.echo(f"✓ Docs repo already cloned (already done)")
+
+        # Sync team prompts to platform prompt location
+        _sync_prompts(config, docs_target, workspace_root)
 
         # Rule download (idempotent — skip if rules exist)
         rules_path = workspace_root / platform_service.get_rules_path(platform)

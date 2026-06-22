@@ -2,9 +2,9 @@ from pathlib import Path
 
 import click
 
-from cli.config.constants import CODE_DIR, DOCS_DIR, AIDLC_DOCS_SUBDIR, RE_SKILLS_SUBDIR
+from cli.config.constants import CODE_DIR, DOCS_DIR, AIDLC_DOCS_SUBDIR, RE_SKILLS_SUBDIR, AIDLC_WORKFLOWS_REPO_OWNER, AIDLC_WORKFLOWS_REPO_NAME
 from cli.exceptions import AidlcError, ConfigNotFoundError
-from cli.services import git_service, workspace_config_service, state_service, staleness_service
+from cli.services import git_service, workspace_config_service, state_service, staleness_service, github_release_service, platform_service
 
 
 @click.command()
@@ -33,6 +33,15 @@ def start():
         module_name = _select_docs_module(aidlc_docs_base, repo_name)
 
         project_dir = aidlc_docs_base / module_name
+
+        # --- Health check ---
+        lines, has_warnings, no_re = _collect_health_status(config, workspace_root, docs_repo_dir, re_skills_base, repo_name)
+        click.echo("")
+        for line in lines:
+            click.echo(f"  {line}")
+        if has_warnings:
+            if not click.confirm("\nContinue anyway?", default=True):
+                raise SystemExit(0)
 
         # --- Step 3: Feature selection ---
         existing = _find_existing_workflows(project_dir)
@@ -82,22 +91,61 @@ def start():
         relative_path = workflow_dir.relative_to(workspace_root)
         click.echo(f"\n✓ Symlink: aidlc-docs/ → {relative_path}/")
 
-        # Check RE skills and guide user
+        # Resolve and write context-specific prompts with actual repo values
+        platform = workspace_config_service.get_platform(config)
+        if platform:
+            docs_prompts_dir = docs_repo_dir / "prompts"
+            platform_service.write_resolved_prompts(
+                platform, docs_prompts_dir, workspace_root,
+                {"repo_name": repo_name, "docs_repo_name": docs_repo_name}
+            )
+
+        # End of flow
         re_skills_repo_dir = re_skills_base / repo_name
-        if not staleness_service.has_re_skills(re_skills_base, repo_name):
+        docs_re_path = f"docs/{docs_repo_name}/skills/{repo_name}/"
+        staleness = staleness_service.check_staleness(repo_name, re_skills_base, workspace_root / CODE_DIR / repo_name)
+
+        if staleness["reason"] == "no_re":
             re_skills_repo_dir.mkdir(parents=True, exist_ok=True)
-            docs_re_path = f"docs/{docs_repo_name}/re-skills/{repo_name}/"
-            click.echo(f"\n⚠  No Reverse Engineering skills found for '{repo_name}'")
-            click.echo("  Open your AI chat and paste the following prompt:")
+            prompt_cmd = platform_service.get_prompt_command(platform, "re-create") if platform else None
+            click.echo(f"\n  No RE skills found. Open your AI chat and either:")
+            click.echo("")
+            if prompt_cmd:
+                click.echo(f"  Option A — Use the registered prompt: {prompt_cmd}")
+                click.echo("")
+                click.echo(f"  Option B — Paste this prompt manually:")
+            else:
+                click.echo(f"  Paste the following prompt:")
             click.echo("")
             click.echo("┌──────────────────────────────────────────────────────────────┐")
             click.echo(f"│  Using AI-DLC, reverse engineer the codebase at              │")
             click.echo(f"│  code/{repo_name + '/':<54}│")
-            click.echo(f"│  and generate the skills/knowledge base files.               │")
-            click.echo(f"│  Store the output in {docs_re_path:<41}│")
+            click.echo(f"│  Keep the output concise — this is for AI agent orientation  │")
+            click.echo(f"│  only, not full documentation. Each file must be under 100   │")
+            click.echo(f"│  lines. Store the output in {docs_re_path:<34}│")
+            click.echo("└──────────────────────────────────────────────────────────────┘")
+        elif staleness["stale"]:
+            prompt_cmd = platform_service.get_prompt_command(platform, "re-update") if platform else None
+            click.echo(f"\n  RE skills are stale ({staleness['commits_since']} commits behind). Open your AI chat and either:")
+            click.echo("")
+            if prompt_cmd:
+                click.echo(f"  Option A — Use the registered prompt: {prompt_cmd}")
+                click.echo("")
+                click.echo(f"  Option B — Paste this prompt manually:")
+            else:
+                click.echo(f"  Paste the following prompt:")
+            click.echo("")
+            click.echo("┌──────────────────────────────────────────────────────────────┐")
+            click.echo(f"│  Using AI-DLC, update RE skills for                          │")
+            click.echo(f"│  code/{repo_name + '/':<54}│")
+            click.echo(f"│  Review and update existing skills in {docs_re_path:<23}│")
             click.echo("└──────────────────────────────────────────────────────────────┘")
         else:
-            click.echo("\n✅ Ready — open your AI chat and describe what you want to build.")
+            load_cmd = platform_service.get_prompt_command(platform, "re-load") if platform else None
+            if load_cmd:
+                click.echo(f"\n✅ Ready — open your AI chat, use {load_cmd} to load RE skills, then describe what you want to build.")
+            else:
+                click.echo("\n✅ Ready — open your AI chat and describe what you want to build.")
 
     except AidlcError as e:
         click.echo(f"✗ {e}", err=True)
@@ -156,8 +204,56 @@ def _select_docs_module(aidlc_docs_base: Path, default_name: str) -> str:
     return click.prompt("Docs module name", default=default_name)
 
 
+def _collect_health_status(config: dict, workspace_root: Path, docs_repo_dir: Path, re_skills_base: Path, repo_name: str) -> tuple[list[str], bool, bool]:
+    """Return status lines, has_warnings flag, and no_re flag."""
+    lines = []
+    has_warnings = False
+    no_re = False
+
+    # Rules version
+    local_version = config.get("rules_version")
+    if not local_version:
+        lines.append("⚠ AI-DLC rules not installed — run 'aidlc update-rules'")
+        has_warnings = True
+    else:
+        try:
+            latest = github_release_service.get_latest_release_info(
+                AIDLC_WORKFLOWS_REPO_OWNER, AIDLC_WORKFLOWS_REPO_NAME
+            )
+            if latest["tag"] != local_version:
+                lines.append(f"⚠ AI-DLC rules outdated ({local_version} → {latest['tag']}) — run 'aidlc update-rules'")
+                has_warnings = True
+            else:
+                lines.append(f"✓ AI-DLC rules up to date ({local_version})")
+        except Exception:
+            lines.append(f"✓ AI-DLC rules {local_version} (could not check remote)")
+
+    # Docs repo staleness
+    if docs_repo_dir.exists():
+        behind = git_service.commits_behind_remote(docs_repo_dir)
+        if behind and behind > 0:
+            lines.append(f"⚠ Docs repo is {behind} commit(s) behind remote — run 'aidlc update-docs'")
+            has_warnings = True
+        else:
+            lines.append("✓ Docs repo up to date")
+
+    # RE skills staleness
+    code_repo_dir = workspace_root / CODE_DIR / repo_name
+    staleness = staleness_service.check_staleness(repo_name, re_skills_base, code_repo_dir)
+    if staleness["reason"] == "no_re":
+        lines.append(f"⚠ No RE skills found for {repo_name}")
+        no_re = True
+    elif staleness["stale"]:
+        lines.append(f"⚠ RE skills for {repo_name} are stale ({staleness['commits_since']} commits) — run 'aidlc re {repo_name}'")
+        has_warnings = True
+    else:
+        lines.append(f"✓ RE skills up to date ({repo_name})")
+
+    return lines, has_warnings, no_re
+
+
 def _find_existing_projects(aidlc_docs_base: Path) -> list[str]:
-    """Find existing module subdirectories under aidlc-docs/ in the docs repo."""
+    """Find existing module subdirectories under docs/ in the docs repo."""
     if not aidlc_docs_base.exists():
         return []
     return [
